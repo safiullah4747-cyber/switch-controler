@@ -1,6 +1,6 @@
 'use strict';
 const express=require('express'), helmet=require('helmet'),cookieParser=require('cookie-parser');
-const crypto=require('crypto'), {Pool}=require('pg'), nodemailer=require('nodemailer'), bcrypt=require('bcryptjs');
+const crypto=require('crypto'), {Pool}=require('pg'), bcrypt=require('bcryptjs');
 const app=express();app.disable('x-powered-by');app.set('trust proxy',1);
 app.use(helmet({contentSecurityPolicy:false}));app.use(express.json({limit:'16kb'}));app.use(cookieParser());
 // Reject cross-site browser writes; device calls authenticate separately with a secret.
@@ -15,6 +15,7 @@ const safeEq=(a,b)=>typeof a==='string'&&typeof b==='string'&&a.length===b.lengt
 const send=(res,code,obj)=>res.status(code).json(obj);
 const emailOK=e=>typeof e==='string'&&/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)&&e.length<=180;
 const pending=new Map();const attempts=new Map();
+function undoLimit(k){const v=attempts.get(k);if(v?.length)v.pop();}
 function limit(k,max=8,windowMs=15*60000){const t=Date.now(),v=attempts.get(k)||[];const recent=v.filter(x=>t-x<windowMs);recent.push(t);attempts.set(k,recent);return recent.length<=max;}
 function sessionCookie(res,uid){const expiry=Date.now()+7*86400000;const data=`${uid}.${expiry}`;res.cookie('ss_session',`${data}.${hmac(data)}`,{httpOnly:true,secure:process.env.NODE_ENV==='production',sameSite:'lax',maxAge:7*86400000,path:'/'});}
 async function auth(req,res,next){const c=req.cookies.ss_session||'',p=c.split('.');if(p.length!==3||!safeEq(hmac(`${p[0]}.${p[1]}`),p[2])||Number(p[1])<Date.now())return send(res,401,{error:'Sign in required'});req.uid=Number(p[0]);if(!Number.isSafeInteger(req.uid))return send(res,401,{error:'Invalid session'});next();}
@@ -25,15 +26,23 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT tru
 CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,owner_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,name TEXT NOT NULL,key_hash TEXT NOT NULL,online_at TIMESTAMPTZ,last_state BOOLEAN DEFAULT false,last_ip TEXT,created_at TIMESTAMPTZ DEFAULT now());
 CREATE TABLE IF NOT EXISTS commands(id BIGSERIAL PRIMARY KEY,device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,action TEXT NOT NULL CHECK(action IN ('on','off','countdown','cancel')),minutes INTEGER,created_at TIMESTAMPTZ DEFAULT now(),acked_at TIMESTAMPTZ);
 CREATE TABLE IF NOT EXISTS schedules(id BIGSERIAL PRIMARY KEY,device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,hour INTEGER NOT NULL,minute INTEGER NOT NULL,action TEXT NOT NULL CHECK(action IN ('on','off')),enabled BOOLEAN DEFAULT true,utc_offset INTEGER DEFAULT 300,last_run TEXT DEFAULT '');`);}
-const transporter=()=>nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:Number(process.env.SMTP_PORT)===465,auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}});
 // Signup uses one-time email verification. Existing verified accounts log in with password.
 const normalizeEmail=v=>String(v||'').trim().toLowerCase();
 const passwordOK=p=>typeof p==='string'&&p.length>=10&&Buffer.byteLength(p,'utf8')<=72;
 async function sendOTP(email,purpose){
-  if(!process.env.SMTP_HOST||!process.env.SMTP_USER||!process.env.SMTP_PASS)throw Object.assign(Error('SMTP not configured'),{status:503});
+  const apiKey=process.env.RESEND_API_KEY,from=process.env.RESEND_FROM;
+  if(!apiKey||!from)throw Object.assign(Error('Resend is not configured'),{status:503});
   const otp=String(crypto.randomInt(100000,1000000));
+  let response;
+  try {
+    response=await fetch('https://api.resend.com/emails',{
+      method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},
+      body:JSON.stringify({from,to:[email],subject:purpose==='signup'?'Smart Switch - Verify Account':'Smart Switch - Reset Password',text:`Your Smart Switch code is ${otp}. It expires in 10 minutes. Never share it.`}),
+      signal:AbortSignal.timeout(12000)
+    });
+  }catch(err){console.error('Resend connection failed:',err.name);throw Object.assign(Error('Email service temporarily unavailable. Try again later.'),{status:503});}
+  if(!response.ok){console.error('Resend rejected email with HTTP status',response.status);throw Object.assign(Error('Email could not be sent. Check Resend settings or try later.'),{status:503});}
   pending.set(purpose+':'+email,{digest:hmac(purpose+':'+email+':'+otp),expires:Date.now()+600000,tries:0});
-  await transporter().sendMail({from:process.env.SMTP_FROM||process.env.SMTP_USER,to:email,subject:'Smart Switch '+(purpose==='signup'?'signup':'password reset')+' code',text:`Your Smart Switch verification code: ${otp}\nExpires in 10 minutes. Never share this code.`});
 }
 function checkOTP(email,purpose,otp){const key=purpose+':'+email,p=pending.get(key);if(!p||Date.now()>p.expires||p.tries++>=5||!/^\d{6}$/.test(otp)||!safeEq(p.digest,hmac(key+':'+otp)))return false;pending.delete(key);return true;}
 app.post('/api/auth/signup/request',async(req,res,next)=>{try{
@@ -43,7 +52,7 @@ app.post('/api/auth/signup/request',async(req,res,next)=>{try{
  const existing=await db('SELECT id FROM users WHERE email=$1',[email]);
  if(existing.rows.length)return send(res,409,{error:'Account already exists. Please log in or reset your password.'});
  const passwordHash=await bcrypt.hash(password,12);
- await sendOTP(email,'signup');
+ try{await sendOTP(email,'signup')}catch(e){undoLimit('signup-ip:'+req.ip);undoLimit('signup-email:'+email);throw e}
  const entry=pending.get('signup:'+email);entry.passwordHash=passwordHash;
  send(res,200,{ok:true,message:'Verification code sent'});
 }catch(e){next(e)}});
@@ -68,7 +77,7 @@ app.post('/api/auth/reset/request',async(req,res,next)=>{try{
  const email=normalizeEmail(req.body.email);if(!emailOK(email))return send(res,400,{error:'Invalid email'});
  if(!limit('reset-ip:'+req.ip,6)||!limit('reset-email:'+email,4))return send(res,429,{error:'Please wait before requesting another code'});
  const r=await db('SELECT id FROM users WHERE email=$1',[email]);
- if(r.rows.length)await sendOTP(email,'reset');
+ if(r.rows.length){try{await sendOTP(email,'reset')}catch(e){undoLimit('reset-ip:'+req.ip);undoLimit('reset-email:'+email);throw e}}
  send(res,200,{ok:true,message:'If the account exists, a reset code has been sent.'});
 }catch(e){next(e)}});
 app.post('/api/auth/reset/confirm',async(req,res,next)=>{try{
@@ -105,6 +114,6 @@ app.post('/api/device/poll',deviceAuth,async(req,res,next)=>{try{const state=req
 app.post('/api/device/ack',deviceAuth,async(req,res,next)=>{try{const id=Number(req.body.id);if(!Number.isSafeInteger(id))return send(res,400,{error:'Invalid command id'});await db('UPDATE commands SET acked_at=now() WHERE id=$1 AND device_id=$2',[id,req.did]);send(res,200,{ok:true});}catch(e){next(e)}});
 app.get('/health',(req,res)=>res.json({ok:true}));
 app.use(express.static(__dirname));
-app.use((err,req,res,next)=>{console.error(err);send(res,500,{error:'Server error'})});
+app.use((err,req,res,next)=>{console.error(err.message||err);send(res,err.status>=400&&err.status<600?err.status:500,{error:err.status?err.message:'Server error'})});
 async function runSchedules(){const now=new Date();const r=await db('SELECT * FROM schedules WHERE enabled=true');for(const s of r.rows){const shifted=new Date(now.getTime()+s.utc_offset*60000);const hh=shifted.getUTCHours(),mm=shifted.getUTCMinutes(),day=shifted.toISOString().slice(0,10);const key=day+':'+hh+':'+mm;if(hh!==s.hour||mm!==s.minute||s.last_run===key)continue;const result=await db('UPDATE schedules SET last_run=$1 WHERE id=$2 AND last_run<>$1 RETURNING id',[key,s.id]);if(result.rowCount)await db('INSERT INTO commands(device_id,action) VALUES($1,$2)',[s.device_id,s.action]);}}
 init().then(()=>{const port=process.env.PORT||3000;app.listen(port,()=>console.log('Smart Switch server listening on',port));setInterval(()=>runSchedules().catch(console.error),30000);}).catch(e=>{console.error('Database initialization failed',e);process.exit(1)});

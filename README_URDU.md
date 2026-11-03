@@ -1,27 +1,25 @@
-# Smart Switch Cloud — Login & Ownership Update
+# Smart Switch Cloud — Resend OTP Update
 
-## GitHub files
-Upload the ROOT files `index.js`, `index.html`, `package.json`, `render.yaml`, `.env.example`, and this README. Replace the old root files. Do not upload the `.env` secrets.
+یہ ZIP GitHub repository کے root میں upload کریں۔ موجودہ `index.js`, `index.html`, `package.json`, `render.yaml`, `.env.example` replace کریں۔
 
-## Render
-Keep the existing Web Service: Root Directory blank; Build `npm install`; Start `node index.js`. Keep `DATABASE_URL`, `SESSION_SECRET` (24+ characters), SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM. Set NODE_ENV=production. Save and deploy.
+## Render Environment
+- `DATABASE_URL`: پہلے والا PostgreSQL URL برقرار رکھیں
+- `SESSION_SECRET`: پہلے والا secret برقرار رکھیں
+- `RESEND_API_KEY`: Resend API key (صرف Render میں)
+- `RESEND_FROM`: `Smart Switch <otp@corentra.website>`
+- `NODE_ENV`: `production`
 
-## New authentication
-- Sign Up: email + password (10+ characters), then email OTP once.
-- Login: email + password; no OTP.
-- Forgot Password: email OTP and new password.
-- Existing accounts created under the earlier OTP-only server have no password. Use Forgot Password to set one.
-- Existing devices remain linked to their original account in PostgreSQL.
+`SMTP_*` اب استعمال نہیں ہوتے؛ کامیاب Resend testing کے بعد انہیں Render سے ہٹا سکتے ہیں۔
 
-## Device ownership
-- Creating device credentials assigns it to the signed-in owner. Only that owner can rename/control/release it.
-- Release requires owner's account password; old device credentials are revoked.
-- After release, a new owner must create new device credentials and enter them physically in ESP-01 local setup.
-- Do not share the device secret. Reflashing ESP-01 does not erase the database owner record.
-- **Important:** Current firmware supports entering generated device credentials, not a cryptographically attested immutable hardware identity. A stronger physical pairing/anti-cloning protocol would require a firmware update.
+## Test
+1. GitHub commit کے بعد Render deployment Live ہونے دیں۔
+2. Signup میں نیا email + password (10+ chars) ڈالیں اور OTP چیک کریں۔
+3. پہلے سے موجود account کے لیے Forgot Password استعمال کریں۔
+4. Resend dashboard میں Emails/Logs سے delivery status دیکھیں۔
 
-## Notes
-- OTP is stored in memory for 10 minutes; restarting Render invalidates pending codes.
-- Existing passwordless users must reset their password; SMTP must be configured.
-- Device GPIO output must not be directly connected to 220V or a motor.
-- Test authentication and device behavior before production.
+## Important
+- OTP صرف نئی signup یا password reset پر چاہیے؛ معمول کے login میں password کافی ہے۔
+- موجودہ database اور cloud device API unchanged ہیں۔
+- یہ ZIP صرف cloud backend ہے، ESP-01 firmware نہیں۔ Automatic hardware pairing اور offline-owner lock ابھی implement نہیں کیے گئے۔
+- OTPs server memory میں ہیں؛ Render restart ہونے سے pending codes expire ہو جائیں گے۔
+- Code syntax tested, live delivery not tested.
