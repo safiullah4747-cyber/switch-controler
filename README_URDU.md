@@ -1,25 +1,25 @@
-# Smart Switch Cloud — Resend OTP Update
+# Smart Switch Cloud — Render / GitHub
 
-یہ ZIP GitHub repository کے root میں upload کریں۔ موجودہ `index.js`, `index.html`, `package.json`, `render.yaml`, `.env.example` replace کریں۔
+## GitHub upload
+Upload the files at the repository ROOT (not nested in a folder). Keep existing Render PostgreSQL database and secrets. Deploy with `npm install` and `node index.js`.
 
 ## Render Environment
-- `DATABASE_URL`: پہلے والا PostgreSQL URL برقرار رکھیں
-- `SESSION_SECRET`: پہلے والا secret برقرار رکھیں
-- `RESEND_API_KEY`: Resend API key (صرف Render میں)
-- `RESEND_FROM`: `Smart Switch <otp@corentra.website>`
-- `NODE_ENV`: `production`
+- `NODE_ENV=production`
+- `DATABASE_URL`: existing Render PostgreSQL URL (secret)
+- `SESSION_SECRET`: existing random secret (do NOT change or sessions will be invalidated)
+- `RESEND_API_KEY`: existing Resend key (secret)
+- `RESEND_FROM=Smart Switch <otp@corentra.website>`
+- `ADMIN_EMAIL`: EXACT verified email of the account allowed to administer devices. This is NOT an admin password. Sign in normally with this account.
 
-`SMTP_*` اب استعمال نہیں ہوتے؛ کامیاب Resend testing کے بعد انہیں Render سے ہٹا سکتے ہیں۔
+`/` user dashboard; `/admin` private admin search by exact email and release device with admin account password. Admin releases recorded in `admin_audit`. Existing users and devices are preserved by migrations.
 
-## Test
-1. GitHub commit کے بعد Render deployment Live ہونے دیں۔
-2. Signup میں نیا email + password (10+ chars) ڈالیں اور OTP چیک کریں۔
-3. پہلے سے موجود account کے لیے Forgot Password استعمال کریں۔
-4. Resend dashboard میں Emails/Logs سے delivery status دیکھیں۔
+## Automatic linking (IMPORTANT)
+The old manual Add Device endpoint and button are removed. The server now provides `POST /api/device/claim` for updated ESP-01 firmware. This is a DEVICE endpoint and must be called by the physical ESP-01 via HTTPS with certificate verification, after its own setup hotspot collects home Wi-Fi and account credentials. JSON body: `{ "email":"user@gmail.com", "password":"ACCOUNT_PASSWORD", "device_id":"12_lowercase_hex", "device_secret":"48_lowercase_hex", "name":"Water Pump" }`. Device ID and secret must be generated randomly once and retained across reboots, not regenerated on each startup. Never log or permanently store the account password on ESP-01. The device secret is its cloud key; keep it private. Server replies with `{ok:true,device_id:...}`; then ESP-01 polls `/api/device/poll` with headers `x-device-id` and `x-device-key` as in the existing protocol.
 
-## Important
-- OTP صرف نئی signup یا password reset پر چاہیے؛ معمول کے login میں password کافی ہے۔
-- موجودہ database اور cloud device API unchanged ہیں۔
-- یہ ZIP صرف cloud backend ہے، ESP-01 firmware نہیں۔ Automatic hardware pairing اور offline-owner lock ابھی implement نہیں کیے گئے۔
-- OTPs server memory میں ہیں؛ Render restart ہونے سے pending codes expire ہو جائیں گے۔
-- Code syntax tested, live delivery not tested.
+**ESP-01 firmware is NOT in this GitHub ZIP and must be updated separately**. Until it is updated, devices will not automatically appear. The first-claim endpoint is not manufacturer-attested; a forged ID/secret could create a phantom device, and physical access can defeat software protections. For production, implement factory provisioned credentials and secure pairing, and do not send passwords over the unencrypted setup hotspot unless the local setup channel is secured. A safer alternative is a cloud browser pairing flow. Admin release only removes cloud ownership; offline firmware locks must be handled separately.
+
+## OTP
+Resend sends signup and reset OTP. Check Spam if not in Inbox. Never upload API keys or .env secrets to GitHub.
+
+## Safety
+Do not connect an unknown 220V pump directly to an ESP-01 or a small general-purpose relay; use a properly rated motor contactor and a qualified electrician.

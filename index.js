@@ -25,7 +25,8 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT true;
 CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,owner_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,name TEXT NOT NULL,key_hash TEXT NOT NULL,online_at TIMESTAMPTZ,last_state BOOLEAN DEFAULT false,last_ip TEXT,created_at TIMESTAMPTZ DEFAULT now());
 CREATE TABLE IF NOT EXISTS commands(id BIGSERIAL PRIMARY KEY,device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,action TEXT NOT NULL CHECK(action IN ('on','off','countdown','cancel')),minutes INTEGER,created_at TIMESTAMPTZ DEFAULT now(),acked_at TIMESTAMPTZ);
-CREATE TABLE IF NOT EXISTS schedules(id BIGSERIAL PRIMARY KEY,device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,hour INTEGER NOT NULL,minute INTEGER NOT NULL,action TEXT NOT NULL CHECK(action IN ('on','off')),enabled BOOLEAN DEFAULT true,utc_offset INTEGER DEFAULT 300,last_run TEXT DEFAULT '');`);}
+CREATE TABLE IF NOT EXISTS schedules(id BIGSERIAL PRIMARY KEY,device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,hour INTEGER NOT NULL,minute INTEGER NOT NULL,action TEXT NOT NULL CHECK(action IN ('on','off')),enabled BOOLEAN DEFAULT true,utc_offset INTEGER DEFAULT 300,last_run TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS admin_audit(id BIGSERIAL PRIMARY KEY,admin_id BIGINT NOT NULL,device_id TEXT NOT NULL,owner_email TEXT NOT NULL,action TEXT NOT NULL,created_at TIMESTAMPTZ DEFAULT now());`);}
 // Signup uses one-time email verification. Existing verified accounts log in with password.
 const normalizeEmail=v=>String(v||'').trim().toLowerCase();
 const passwordOK=p=>typeof p==='string'&&p.length>=10&&Buffer.byteLength(p,'utf8')<=72;
@@ -91,7 +92,26 @@ app.post('/api/auth/reset/confirm',async(req,res,next)=>{try{
 app.post('/api/auth/logout',(req,res)=>{res.clearCookie('ss_session',{path:'/'});send(res,200,{ok:true})});
 app.get('/api/me',auth,async(req,res,next)=>{try{const r=await db('SELECT email FROM users WHERE id=$1',[req.uid]);send(res,200,{email:r.rows[0]?.email||''});}catch(e){next(e)}});
 app.get('/api/devices',auth,async(req,res,next)=>{try{const r=await db('SELECT id,name,last_state,online_at,created_at FROM devices WHERE owner_id=$1 ORDER BY created_at DESC',[req.uid]);send(res,200,{devices:r.rows.map(x=>({...x,online:!!x.online_at&&Date.now()-new Date(x.online_at).getTime()<90000}))});}catch(e){next(e)}});
-app.post('/api/devices',auth,async(req,res,next)=>{try{const r=await db('SELECT count(*)::int AS n FROM devices WHERE owner_id=$1',[req.uid]);if(r.rows[0].n>=20)return send(res,400,{error:'Maximum 20 devices'});const id=rand(6),key=rand(24),name=String(req.body.name||'My Switch').slice(0,40);await db('INSERT INTO devices(id,owner_id,name,key_hash) VALUES($1,$2,$3,$4)',[id,req.uid,name,hash(key)]);send(res,200,{id,key,name,note:'Copy the key now. It will not be shown again.'});}catch(e){next(e)}});
+// Device-initiated account linking. ESP-01 must call over verified HTTPS after local setup.
+// A stable random 12-hex device ID and 48-hex device secret must be stored on the physical device.
+// This is NOT a manufacturer-attested identity; physical tamper resistance is outside ESP-01 capabilities.
+app.post('/api/device/claim',async(req,res,next)=>{try{
+ const email=normalizeEmail(req.body.email),password=String(req.body.password||'');
+ const id=String(req.body.device_id||''),key=String(req.body.device_secret||'');
+ const name=String(req.body.name||'My Switch').trim().slice(0,40)||'My Switch';
+ if(!limit('claim-ip:'+req.ip,8))return send(res,429,{error:'Too many pairing attempts'});
+ if(!emailOK(email)||!/^[0-9a-f]{12}$/.test(id)||!/^[0-9a-f]{48}$/.test(key))return send(res,400,{error:'Invalid pairing information'});
+ const u=await db('SELECT id,password_hash FROM users WHERE email=$1 AND verified=true',[email]);
+ if(!u.rows.length||!u.rows[0].password_hash||!(await bcrypt.compare(password,u.rows[0].password_hash)))return send(res,401,{error:'Invalid account credentials'});
+ const uid=u.rows[0].id;
+ // Atomic first-claim; an already owned device cannot be transferred by this endpoint.
+ const r=await db(`INSERT INTO devices(id,owner_id,name,key_hash) VALUES($1,$2,$3,$4)
+ ON CONFLICT(id) DO NOTHING RETURNING id`,[id,uid,name,hash(key)]);
+ if(!r.rows.length){const old=await db('SELECT owner_id,key_hash FROM devices WHERE id=$1',[id]);
+   if(String(old.rows[0]?.owner_id)!==String(uid)||!safeEq(old.rows[0]?.key_hash||'',hash(key)))return send(res,409,{error:'Device already registered or credentials do not match. Owner/admin release required.'});
+ }
+ send(res,200,{ok:true,device_id:id,message:'Device linked to your account'});
+}catch(e){next(e)}});
 async function owned(req,res,next){try{const r=await db('SELECT * FROM devices WHERE id=$1 AND owner_id=$2',[req.params.id,req.uid]);if(!r.rows.length)return send(res,404,{error:'Device not found'});req.device=r.rows[0];next();}catch(e){next(e)}}
 app.patch('/api/devices/:id',auth,owned,async(req,res,next)=>{try{const name=String(req.body.name||'').trim();if(!name||name.length>40)return send(res,400,{error:'Invalid name'});await db('UPDATE devices SET name=$1 WHERE id=$2',[name,req.params.id]);send(res,200,{ok:true});}catch(e){next(e)}});
 app.post('/api/devices/:id/release',auth,owned,async(req,res,next)=>{try{
@@ -112,6 +132,37 @@ app.delete('/api/devices/:id/schedules/:sid',auth,owned,async(req,res,next)=>{tr
 async function deviceAuth(req,res,next){try{const id=String(req.get('x-device-id')||''),key=String(req.get('x-device-key')||'');if(!/^[0-9a-f]{12}$/.test(id)||!/^[0-9a-f]{48}$/.test(key))return send(res,401,{error:'Invalid device credentials'});const r=await db('SELECT id,key_hash FROM devices WHERE id=$1',[id]);if(!r.rows.length||!safeEq(r.rows[0].key_hash,hash(key)))return send(res,401,{error:'Unauthorized device'});req.did=id;next();}catch(e){next(e)}}
 app.post('/api/device/poll',deviceAuth,async(req,res,next)=>{try{const state=req.body.on===true;await db('UPDATE devices SET last_state=$1,online_at=now() WHERE id=$2',[state,req.did]);const r=await db("SELECT id,action,minutes FROM commands WHERE device_id=$1 AND acked_at IS NULL AND created_at > now() - interval '90 seconds' ORDER BY id ASC LIMIT 1",[req.did]);send(res,200,{command:r.rows[0]||null});}catch(e){next(e)}});
 app.post('/api/device/ack',deviceAuth,async(req,res,next)=>{try{const id=Number(req.body.id);if(!Number.isSafeInteger(id))return send(res,400,{error:'Invalid command id'});await db('UPDATE commands SET acked_at=now() WHERE id=$1 AND device_id=$2',[id,req.did]);send(res,200,{ok:true});}catch(e){next(e)}});
+// Admin role is assigned ONLY by ADMIN_EMAIL environment variable, never by public signup.
+async function adminOnly(req,res,next){try{
+ const r=await db('SELECT email FROM users WHERE id=$1 AND verified=true',[req.uid]);
+ const adminEmail=normalizeEmail(process.env.ADMIN_EMAIL);
+ if(!adminEmail||!r.rows.length||r.rows[0].email!==adminEmail)return send(res,403,{error:'Admin access only'});
+ next();
+}catch(e){next(e)}}
+app.get('/api/admin/users',auth,adminOnly,async(req,res,next)=>{try{
+ const email=normalizeEmail(req.query.email);
+ if(!emailOK(email))return send(res,400,{error:'Enter exact user email'});
+ if(!limit('admin-search:'+req.uid,60))return send(res,429,{error:'Too many searches'});
+ const r=await db(`SELECT u.email,d.id,d.name,d.last_state,d.online_at,d.created_at
+ FROM users u LEFT JOIN devices d ON d.owner_id=u.id WHERE u.email=$1 ORDER BY d.created_at DESC`,[email]);
+ send(res,200,{email,found:r.rows.length>0,devices:r.rows.filter(x=>x.id).map(x=>({...x,online:!!x.online_at&&Date.now()-new Date(x.online_at).getTime()<90000}))});
+}catch(e){next(e)}});
+app.post('/api/admin/devices/:id/release',auth,adminOnly,async(req,res,next)=>{try{
+ if(!limit('admin-release:'+req.uid,6,3600000))return send(res,429,{error:'Release limit reached'});
+ const password=String(req.body.password||'');
+ const user=await db('SELECT password_hash FROM users WHERE id=$1',[req.uid]);
+ if(!user.rows[0]?.password_hash||!(await bcrypt.compare(password,user.rows[0].password_hash)))return send(res,403,{error:'Admin password incorrect'});
+ const client=await pool.connect();try{
+   await client.query('BEGIN');
+   const r=await client.query('SELECT d.id,u.email FROM devices d JOIN users u ON u.id=d.owner_id WHERE d.id=$1 FOR UPDATE OF d',[req.params.id]);
+   if(!r.rows.length){await client.query('ROLLBACK');return send(res,404,{error:'Device not found'})}
+   await client.query('INSERT INTO admin_audit(admin_id,device_id,owner_email,action) VALUES($1,$2,$3,$4)',[req.uid,r.rows[0].id,r.rows[0].email,'admin_release']);
+   await client.query('DELETE FROM devices WHERE id=$1',[req.params.id]);
+   await client.query('COMMIT');
+ }catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}
+ send(res,200,{ok:true,message:'Cloud ownership released; old credentials revoked. Physical firmware may require re-provisioning.'});
+}catch(e){next(e)}});
+app.get('/admin',auth,adminOnly,(req,res)=>res.sendFile(require('path').join(__dirname,'admin.html')));
 app.get('/health',(req,res)=>res.json({ok:true}));
 app.use(express.static(__dirname));
 app.use((err,req,res,next)=>{console.error(err.message||err);send(res,err.status>=400&&err.status<600?err.status:500,{error:err.status?err.message:'Server error'})});

@@ -15,3 +15,5 @@ services:
         sync: false
       - key: RESEND_FROM
         sync: false
+      - key: ADMIN_EMAIL
+        sync: false
