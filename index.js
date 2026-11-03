@@ -1,7 +1,15 @@
 'use strict';
 const express=require('express'), helmet=require('helmet'),cookieParser=require('cookie-parser');
 const crypto=require('crypto'), {Pool}=require('pg'), nodemailer=require('nodemailer');
-const app=express();app.disable('x-powered-by');app.set('trust proxy',1);
+const app=express();
+const path = require('path');
+
+app.use(express.static(path.join(__dirname)));
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+app.disable('x-powered-by');app.set('trust proxy',1);
 app.use(helmet({contentSecurityPolicy:false}));app.use(express.json({limit:'16kb'}));app.use(cookieParser());
 // Reject cross-site browser writes; device calls authenticate separately with a secret.
 app.use((req,res,next)=>{if(!['POST','PATCH','DELETE','PUT'].includes(req.method)||req.path.startsWith('/api/device/'))return next();const origin=req.get('origin');if(origin){try{const u=new URL(origin);if(u.host!==req.get('host')||u.protocol!=='https:'&&process.env.NODE_ENV==='production')return send(res,403,{error:'Cross-site request blocked'});}catch{return send(res,403,{error:'Invalid origin'})}}next()});
